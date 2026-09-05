@@ -1,0 +1,16 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python packages/cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Installed packages
+site-packages/
+
+# ML/data
+*.pyc
