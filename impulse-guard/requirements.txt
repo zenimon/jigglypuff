@@ -1,8 +1,0 @@
-numpy
-scipy
-soundfile
-librosa
-pystoi
-pesq
-pandas
-pyserial

@@ -1,523 +1,1689 @@
-import numpy as np
-import librosa
-import soundfile as sf
+#!/usr/bin/env python3
+
+"""
+Impulse Guard - Production Combined Mixture Generator
+
+Orchestrates the existing:
+
+    scripts/mix_data.py
+    scripts/mix_impulse.py
+
+Mixture types:
+
+    clean
+    normal_noise
+    two_normal_noises
+    impulse
+    normal_plus_impulse
+    two_normal_plus_impulse
+
+All speech/noise/impulse sources are split-aware.
+"""
+
+from pathlib import Path
+
 import json
-import os
+import random
+
+import librosa
+import numpy as np
+import soundfile as sf
+
+from scripts.mix_data import (
+    load_split_file,
+    load_jsonl,
+    resolve_dataset_path,
+    calculate_rms,
+    calculate_snr_db,
+    scale_noise_to_snr,
+    NORMAL_NOISE_CATEGORIES,
+    SNR_CHOICES,
+)
+
+from scripts.mix_impulse import (
+    add_impulse_arrays,
+    IMPULSE_GAINS,
+)
 
 
-# ======================================================
-# 1. Save metadata
-# ======================================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-def save_metadata(metadata_path, metadata):
+SAMPLE_RATE = 16000
 
-    os.makedirs(
-        os.path.dirname(metadata_path),
-        exist_ok=True
+CLIP_DURATION_SEC = 5.0
+
+CLIP_SAMPLES = int(
+    SAMPLE_RATE * CLIP_DURATION_SEC
+)
+
+OUTPUT_ROOT = Path(
+    "data/mixtures"
+)
+
+METADATA_PATH = Path(
+    "data/metadata/samples.jsonl"
+)
+
+NOISE_METADATA_PATH = Path(
+    "data/metadata/noise_metadata.jsonl"
+)
+
+
+# ============================================================
+# MIXTURE DISTRIBUTION
+# ============================================================
+
+MIXTURE_DISTRIBUTION = [
+    ("clean", 0.10),
+    ("normal_noise", 0.20),
+    ("two_normal_noises", 0.15),
+    ("impulse", 0.10),
+    ("normal_plus_impulse", 0.25),
+    ("two_normal_plus_impulse", 0.20),
+]
+
+
+# ============================================================
+# SAMPLE ID
+# ============================================================
+
+def get_next_sample_id():
+    """
+    Find the next available IG_XXXXXX ID.
+    """
+
+    max_id = 0
+
+    if not METADATA_PATH.exists():
+        return 1
+
+    with open(
+        METADATA_PATH,
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                record = json.loads(line)
+
+            except json.JSONDecodeError:
+                continue
+
+            sample_id = record.get(
+                "sample_id",
+                "",
+            )
+
+            if not sample_id.startswith("IG_"):
+                continue
+
+            try:
+                number = int(
+                    sample_id[3:]
+                )
+
+                max_id = max(
+                    max_id,
+                    number,
+                )
+
+            except ValueError:
+                pass
+
+    return max_id + 1
+
+
+# ============================================================
+# AUDIO
+# ============================================================
+
+def load_audio(path):
+    """
+    Load audio as mono 16 kHz float32.
+    """
+
+    audio, _ = librosa.load(
+        str(path),
+        sr=SAMPLE_RATE,
+        mono=True,
     )
 
-    with open(metadata_path, "a") as f:
+    audio = np.asarray(
+        audio,
+        dtype=np.float32,
+    )
 
-        f.write(
-            json.dumps(metadata) + "\n"
+    if audio.size == 0:
+        raise ValueError(
+            f"Audio is empty: {path}"
         )
 
+    if not np.isfinite(audio).all():
+        raise ValueError(
+            f"Audio contains NaN/Inf: {path}"
+        )
 
-# ======================================================
-# 2. Mix clean speech with normal noise
-# ======================================================
+    return audio
 
-def mix_normal_noise(
+
+def prepare_clean_audio(audio):
+    """
+    Make speech exactly 5 seconds.
+
+    Longer:
+        random crop
+
+    Shorter:
+        zero pad
+    """
+
+    audio = np.asarray(
+        audio,
+        dtype=np.float32,
+    )
+
+    if len(audio) > CLIP_SAMPLES:
+
+        max_start = (
+            len(audio)
+            - CLIP_SAMPLES
+        )
+
+        start = random.randint(
+            0,
+            max_start,
+        )
+
+        audio = audio[
+            start:start + CLIP_SAMPLES
+        ]
+
+    elif len(audio) < CLIP_SAMPLES:
+
+        padded = np.zeros(
+            CLIP_SAMPLES,
+            dtype=np.float32,
+        )
+
+        padded[:len(audio)] = audio
+
+        audio = padded
+
+    return audio.astype(
+        np.float32
+    )
+
+
+# ============================================================
+# NOISE METADATA
+# ============================================================
+
+def build_noise_metadata_index():
+    """
+    Build:
+
+        category -> records
+
+    from noise_metadata.jsonl.
+    """
+
+    records = load_jsonl(
+        NOISE_METADATA_PATH
+    )
+
+    index = {}
+
+    for record in records:
+
+        category = record.get(
+            "category"
+        )
+
+        if category not in NORMAL_NOISE_CATEGORIES:
+            continue
+
+        file_value = record.get(
+            "file"
+        )
+
+        if not file_value:
+            continue
+
+        index.setdefault(
+            category,
+            [],
+        ).append(record)
+
+    return index
+
+
+def build_split_noise_index(
+    split,
+    noise_metadata_index,
+):
+    """
+    Restrict noise metadata to the requested split.
+    """
+
+    noise_files = load_split_file(
+        f"noise_{split}.txt"
+    )
+
+    noise_set = {
+        str(path)
+        for path in noise_files
+    }
+
+    result = {}
+
+    for category, records in (
+        noise_metadata_index.items()
+    ):
+
+        for record in records:
+
+            path = resolve_dataset_path(
+                record["file"]
+            )
+
+            if str(path) not in noise_set:
+                continue
+
+            result.setdefault(
+                category,
+                [],
+            ).append(record)
+
+    return result
+
+
+def choose_normal_noise(
+    split_noise_index,
+):
+    """
+    Balanced category selection.
+    """
+
+    available = [
+        category
+        for category in NORMAL_NOISE_CATEGORIES
+        if (
+            category in split_noise_index
+            and split_noise_index[category]
+        )
+    ]
+
+    if not available:
+        raise RuntimeError(
+            "No normal noise available."
+        )
+
+    category = random.choice(
+        available
+    )
+
+    record = random.choice(
+        split_noise_index[category]
+    )
+
+    path = resolve_dataset_path(
+        record["file"]
+    )
+
+    return (
+        category,
+        record,
+        path,
+    )
+
+
+def build_gunshot_records(split):
+    """
+    Get gunshot recordings belonging
+    to the requested split.
+    """
+
+    noise_files = load_split_file(
+        f"noise_{split}.txt"
+    )
+
+    noise_set = {
+        str(path)
+        for path in noise_files
+    }
+
+    records = load_jsonl(
+        NOISE_METADATA_PATH
+    )
+
+    gunshots = []
+
+    for record in records:
+
+        if record.get(
+            "category"
+        ) != "gunshot":
+            continue
+
+        file_value = record.get(
+            "file"
+        )
+
+        if not file_value:
+            continue
+
+        path = resolve_dataset_path(
+            file_value
+        )
+
+        if str(path) not in noise_set:
+            continue
+
+        gunshots.append(
+            record
+        )
+
+    if not gunshots:
+        raise RuntimeError(
+            f"No gunshot recordings found "
+            f"in {split} split."
+        )
+
+    return gunshots
+
+
+# ============================================================
+# CLIPPING PROTECTION
+# ============================================================
+
+def protect_clipping(
     clean,
-    noise,
-    target_snr_db
-):
-
-    # Repeat noise if it is shorter than speech
-
-    if len(noise) < len(clean):
-
-        repeats = int(
-            np.ceil(len(clean) / len(noise))
-        )
-
-        noise = np.tile(
-            noise,
-            repeats
-        )
-
-    # Make noise exactly as long as speech
-
-    noise = noise[:len(clean)]
-
-    # Calculate RMS
-
-    speech_rms = np.sqrt(
-        np.mean(clean ** 2)
-    )
-
-    noise_rms = np.sqrt(
-        np.mean(noise ** 2)
-    )
-
-    # Avoid division by zero
-
-    if noise_rms == 0:
-
-        raise ValueError(
-            "Noise RMS is zero."
-        )
-
-    # Calculate required noise RMS
-
-    target_noise_rms = (
-        speech_rms /
-        (10 ** (target_snr_db / 20))
-    )
-
-    # Scale noise
-
-    noise = (
-        noise *
-        target_noise_rms /
-        noise_rms
-    )
-
-    # Mix
-
-    noisy = clean + noise
-
-    return noisy, noise
-
-
-# ======================================================
-# 3. Add impulse
-# ======================================================
-
-def add_impulse(
     noisy,
-    impulse,
-    impulse_gain=0.5
 ):
+    """
+    Protect clean/noisy signals from clipping.
 
-    # Normalize impulse peak
+    The signals are scaled TOGETHER so their
+    relationship is preserved.
 
-    impulse_peak = np.max(
-        np.abs(impulse)
-    )
+    Target peak:
+        0.98
 
-    if impulse_peak > 0:
+    No hard clipping is performed.
+    """
 
-        impulse = (
-            impulse /
-            impulse_peak
-        )
-
-    # Control impulse strength
-
-    impulse = impulse * impulse_gain
-
-    # Select random insertion point
-
-    max_start = (
-        len(noisy) -
-        len(impulse)
-    )
-
-    if max_start <= 0:
-
-        raise ValueError(
-            "Impulse is longer than speech."
-        )
-
-    start = np.random.randint(
-        0,
-        max_start
-    )
-
-    # Add impulse
-
-    mixed = noisy.copy()
-
-    mixed[
-        start:start + len(impulse)
-    ] += impulse
-
-    return mixed, impulse, start
-
-
-# ======================================================
-# 4. Main mixing function
-# ======================================================
-
-def create_combined_sample(
-    target_snr_db,
-    impulse_gain,
-    sample_number
-):
-
-    clean_path = (
-        "data/training/clean/speech1.wav"
-    )
-
-    normal_noise_path = (
-        "data/tests/noise.wav"
-    )
-
-    impulse_path = (
-        "data/impulses/impulse1.wav"
-    )
-
-    # --------------------------------------------------
-    # Unique sample name
-    # --------------------------------------------------
-
-    sample_id = (
-        f"COMBINED_{sample_number:03d}"
-    )
-
-    output_filename = (
-        f"{sample_id}_snr_{target_snr_db}db_gain_{impulse_gain}.wav"
-    )
-
-    output_path = os.path.join(
-        "data/training/noisy",
-        output_filename
-    )
-
-    # --------------------------------------------------
-    # Load audio
-    # --------------------------------------------------
-
-    clean, _ = librosa.load(
-        clean_path,
-        sr=16000,
-        mono=True
-    )
-
-    normal_noise, _ = librosa.load(
-        normal_noise_path,
-        sr=16000,
-        mono=True
-    )
-
-    impulse, _ = librosa.load(
-        impulse_path,
-        sr=16000,
-        mono=True
-    )
-
-    # --------------------------------------------------
-    # Add normal noise
-    # --------------------------------------------------
-
-    noisy, scaled_noise = mix_normal_noise(
+    clean = np.asarray(
         clean,
-        normal_noise,
-        target_snr_db
-    )
+        dtype=np.float32,
+    ).copy()
 
-    # --------------------------------------------------
-    # Add impulse
-    # --------------------------------------------------
-
-    mixed, impulse, start = add_impulse(
+    noisy = np.asarray(
         noisy,
-        impulse,
-        impulse_gain
+        dtype=np.float32,
+    ).copy()
+
+    if clean.size == 0:
+        raise ValueError(
+            "Clean audio is empty."
+        )
+
+    if noisy.size == 0:
+        raise ValueError(
+            "Noisy audio is empty."
+        )
+
+    if not np.isfinite(clean).all():
+        raise ValueError(
+            "Clean audio contains NaN/Inf."
+        )
+
+    if not np.isfinite(noisy).all():
+        raise ValueError(
+            "Noisy audio contains NaN/Inf."
+        )
+
+    clean_peak = float(
+        np.max(
+            np.abs(clean)
+        )
     )
 
-    # --------------------------------------------------
-    # Prevent clipping
-    # --------------------------------------------------
-
-    peak = np.max(
-        np.abs(mixed)
+    noisy_peak = float(
+        np.max(
+            np.abs(noisy)
+        )
     )
 
-    if peak > 1.0:
+    peak = max(
+        clean_peak,
+        noisy_peak,
+    )
 
-        gain = 1.0 / peak
+    target_peak = 0.98
 
-        clean = clean * gain
-        noisy = noisy * gain
-        mixed = mixed * gain
-        scaled_noise = scaled_noise * gain
-        impulse = impulse * gain
+    if peak > target_peak:
 
-        print("Clipping detected.")
-        print("Applied gain:", gain)
+        scale = (
+            target_peak
+            / peak
+        )
+
+        clean *= scale
+        noisy *= scale
 
     else:
 
-        print("No clipping.")
+        scale = 1.0
 
-    # --------------------------------------------------
-    # Calculate timing
-    # --------------------------------------------------
+    # --------------------------------------------------------
+    # Final numerical verification
+    # --------------------------------------------------------
 
-    start_time = start / 16000
-
-    impulse_duration = (
-        len(impulse) / 16000
-    )
-
-    end_time = (
-        start_time +
-        impulse_duration
-    )
-
-    # --------------------------------------------------
-    # Calculate RMS and actual SNR
-    # --------------------------------------------------
-
-    speech_rms = np.sqrt(
-        np.mean(clean ** 2)
-    )
-
-    noise_rms = np.sqrt(
-        np.mean(scaled_noise ** 2)
-    )
-
-    actual_snr_db = (
-        20 *
-        np.log10(
-            speech_rms /
-            noise_rms
+    clean_peak_after = float(
+        np.max(
+            np.abs(clean)
         )
     )
 
-    # --------------------------------------------------
-    # Metadata
-    # --------------------------------------------------
+    noisy_peak_after = float(
+        np.max(
+            np.abs(noisy)
+        )
+    )
 
-    metadata = {
+    # Extremely small float32 rounding can theoretically
+    # push the value a few ulps above 0.98. Apply one more
+    # common scale if necessary.
+    final_peak = max(
+        clean_peak_after,
+        noisy_peak_after,
+    )
 
-        "sample_id": sample_id,
+    if final_peak > target_peak:
 
-        "audio": {
+        extra_scale = (
+            target_peak
+            / final_peak
+        )
 
-            "sample_rate": 16000,
+        clean *= extra_scale
+        noisy *= extra_scale
+
+        scale *= extra_scale
+
+    clean = clean.astype(
+        np.float32
+    )
+
+    noisy = noisy.astype(
+        np.float32
+    )
+
+    # --------------------------------------------------------
+    # Final float32 verification
+    # --------------------------------------------------------
+
+    final_clean_peak = float(
+        np.max(
+            np.abs(clean)
+        )
+    )
+
+    final_noisy_peak = float(
+        np.max(
+            np.abs(noisy)
+        )
+    )
+
+    if final_clean_peak > 0.981:
+        raise RuntimeError(
+            "Clean clipping protection failed: "
+            f"peak={final_clean_peak:.9f}"
+        )
+
+    if final_noisy_peak > 0.981:
+        raise RuntimeError(
+            "Noisy clipping protection failed: "
+            f"peak={final_noisy_peak:.9f}"
+        )
+
+    return (
+        clean,
+        noisy,
+        float(scale),
+    )
+
+
+# ============================================================
+# TWO-NOISE MIXING
+# ============================================================
+
+def add_two_normal_noises(
+    clean,
+    noise1,
+    noise2,
+    target_snr,
+):
+    """
+    Add two independent continuous noises.
+
+    Both noises are scaled relative to
+    the ORIGINAL clean speech.
+
+    Each noise receives half of the
+    requested total noise power.
+    """
+
+    clean_rms = calculate_rms(
+        clean
+    )
+
+    total_target_power = (
+        clean_rms ** 2
+        / (
+            10.0
+            ** (
+                target_snr
+                / 10.0
+            )
+        )
+    )
+
+    individual_target_power = (
+        total_target_power
+        / 2.0
+    )
+
+    individual_target_snr = (
+        10.0
+        * np.log10(
+            (
+                clean_rms
+                ** 2
+            )
+            / individual_target_power
+        )
+    )
+
+    scaled1 = scale_noise_to_snr(
+        clean,
+        noise1,
+        individual_target_snr,
+    )
+
+    scaled2 = scale_noise_to_snr(
+        clean,
+        noise2,
+        individual_target_snr,
+    )
+
+    noisy = (
+        clean
+        + scaled1
+        + scaled2
+    )
+
+    actual_noise = (
+        scaled1
+        + scaled2
+    )
+
+    actual_snr = calculate_snr_db(
+        clean,
+        actual_noise,
+    )
+
+    return (
+        noisy.astype(np.float32),
+        scaled1.astype(np.float32),
+        scaled2.astype(np.float32),
+        float(actual_snr),
+    )
+
+
+# ============================================================
+# SINGLE SAMPLE GENERATION
+# ============================================================
+
+def generate_sample(
+    split,
+    mixture_type,
+    speech_path,
+    split_noise_index,
+    gunshot_records,
+):
+    """
+    Generate one complete 5-second mixture.
+    """
+
+    # --------------------------------------------------------
+    # Clean speech
+    # --------------------------------------------------------
+
+    clean = prepare_clean_audio(
+        load_audio(
+            speech_path
+        )
+    )
+
+    # --------------------------------------------------------
+    # Clean sample
+    # --------------------------------------------------------
+
+    if mixture_type == "clean":
+
+        noisy = clean.copy()
+
+        return (
+            clean,
+            noisy,
+            {
+                "target_snr_db": None,
+                "actual_snr_db": None,
+                "noise_components": [],
+                "impulse": None,
+                "clipping_scale": 1.0,
+            },
+        )
+
+    # --------------------------------------------------------
+    # Target SNR
+    # --------------------------------------------------------
+
+    target_snr = random.choice(
+        SNR_CHOICES
+    )
+
+    noise_components = []
+
+    impulse_metadata = None
+
+    # ========================================================
+    # ONE NORMAL NOISE
+    # ========================================================
+
+    if mixture_type == "normal_noise":
+
+        category, record, path = (
+            choose_normal_noise(
+                split_noise_index
+            )
+        )
+
+        noise = load_audio(
+            path
+        )
+
+        scaled_noise = (
+            scale_noise_to_snr(
+                clean,
+                noise,
+                target_snr,
+            )
+        )
+
+        noisy = (
+            clean
+            + scaled_noise
+        )
+
+        noise_components.append(
+            {
+                "path": str(path),
+                "source": record.get(
+                    "source"
+                ),
+                "category": category,
+                "type": record.get(
+                    "type"
+                ),
+                "target_snr_db": float(
+                    target_snr
+                ),
+            }
+        )
+
+    # ========================================================
+    # TWO NORMAL NOISES
+    # ========================================================
+
+    elif mixture_type == "two_normal_noises":
+
+        category1, record1, path1 = (
+            choose_normal_noise(
+                split_noise_index
+            )
+        )
+
+        category2, record2, path2 = (
+            choose_normal_noise(
+                split_noise_index
+            )
+        )
+
+        noise1 = load_audio(
+            path1
+        )
+
+        noise2 = load_audio(
+            path2
+        )
+
+        (
+            noisy,
+            scaled1,
+            scaled2,
+            actual_snr,
+        ) = add_two_normal_noises(
+            clean,
+            noise1,
+            noise2,
+            target_snr,
+        )
+
+        noise_components.extend(
+            [
+                {
+                    "path": str(path1),
+                    "source": record1.get(
+                        "source"
+                    ),
+                    "category": category1,
+                    "type": record1.get(
+                        "type"
+                    ),
+                },
+                {
+                    "path": str(path2),
+                    "source": record2.get(
+                        "source"
+                    ),
+                    "category": category2,
+                    "type": record2.get(
+                        "type"
+                    ),
+                },
+            ]
+        )
+
+    # ========================================================
+    # IMPULSE ONLY
+    # ========================================================
+
+    elif mixture_type == "impulse":
+
+        gunshot = random.choice(
+            gunshot_records
+        )
+
+        impulse_path = (
+            resolve_dataset_path(
+                gunshot["file"]
+            )
+        )
+
+        gain = random.choice(
+            IMPULSE_GAINS
+        )
+
+        (
+            clean_after,
+            noisy,
+            impulse_info,
+        ) = add_impulse_arrays(
+            clean,
+            load_audio(
+                impulse_path
+            ),
+            impulse_gain=gain,
+        )
+
+        clean = clean_after
+
+        impulse_metadata = {
+            "path": str(
+                impulse_path
+            ),
+            "source": gunshot.get(
+                "source"
+            ),
+            "category": "gunshot",
+            "type": "impulsive",
+            **impulse_info,
+        }
+
+    # ========================================================
+    # NORMAL + IMPULSE
+    # ========================================================
+
+    elif mixture_type == "normal_plus_impulse":
+
+        category, record, path = (
+            choose_normal_noise(
+                split_noise_index
+            )
+        )
+
+        noise = load_audio(
+            path
+        )
+
+        scaled_noise = (
+            scale_noise_to_snr(
+                clean,
+                noise,
+                target_snr,
+            )
+        )
+
+        base_noisy = (
+            clean
+            + scaled_noise
+        )
+
+        gunshot = random.choice(
+            gunshot_records
+        )
+
+        impulse_path = (
+            resolve_dataset_path(
+                gunshot["file"]
+            )
+        )
+
+        gain = random.choice(
+            IMPULSE_GAINS
+        )
+
+        (
+            _,
+            noisy,
+            impulse_info,
+        ) = add_impulse_arrays(
+            base_noisy,
+            load_audio(
+                impulse_path
+            ),
+            impulse_gain=gain,
+        )
+
+        impulse_metadata = {
+            "path": str(
+                impulse_path
+            ),
+            "source": gunshot.get(
+                "source"
+            ),
+            "category": "gunshot",
+            "type": "impulsive",
+            **impulse_info,
+        }
+
+        noise_components.append(
+            {
+                "path": str(path),
+                "source": record.get(
+                    "source"
+                ),
+                "category": category,
+                "type": record.get(
+                    "type"
+                ),
+                "target_snr_db": float(
+                    target_snr
+                ),
+            }
+        )
+
+    # ========================================================
+    # TWO NORMAL + IMPULSE
+    # ========================================================
+
+    elif mixture_type == "two_normal_plus_impulse":
+
+        category1, record1, path1 = (
+            choose_normal_noise(
+                split_noise_index
+            )
+        )
+
+        category2, record2, path2 = (
+            choose_normal_noise(
+                split_noise_index
+            )
+        )
+
+        noise1 = load_audio(
+            path1
+        )
+
+        noise2 = load_audio(
+            path2
+        )
+
+        (
+            base_noisy,
+            scaled1,
+            scaled2,
+            actual_snr,
+        ) = add_two_normal_noises(
+            clean,
+            noise1,
+            noise2,
+            target_snr,
+        )
+
+        gunshot = random.choice(
+            gunshot_records
+        )
+
+        impulse_path = (
+            resolve_dataset_path(
+                gunshot["file"]
+            )
+        )
+
+        gain = random.choice(
+            IMPULSE_GAINS
+        )
+
+        (
+            _,
+            noisy,
+            impulse_info,
+        ) = add_impulse_arrays(
+            base_noisy,
+            load_audio(
+                impulse_path
+            ),
+            impulse_gain=gain,
+        )
+
+        impulse_metadata = {
+            "path": str(
+                impulse_path
+            ),
+            "source": gunshot.get(
+                "source"
+            ),
+            "category": "gunshot",
+            "type": "impulsive",
+            **impulse_info,
+        }
+
+        noise_components.extend(
+            [
+                {
+                    "path": str(path1),
+                    "source": record1.get(
+                        "source"
+                    ),
+                    "category": category1,
+                    "type": record1.get(
+                        "type"
+                    ),
+                },
+                {
+                    "path": str(path2),
+                    "source": record2.get(
+                        "source"
+                    ),
+                    "category": category2,
+                    "type": record2.get(
+                        "type"
+                    ),
+                },
+            ]
+        )
+
+    else:
+
+        raise ValueError(
+            f"Unknown mixture type: "
+            f"{mixture_type}"
+        )
+
+    # ========================================================
+    # FINAL COMMON CLIPPING PROTECTION
+    # ========================================================
+
+    clean, noisy, clipping_scale = (
+        protect_clipping(
+            clean,
+            noisy,
+        )
+    )
+
+    # ========================================================
+    # ACTUAL SNR
+    # ========================================================
+
+    if mixture_type in {
+        "normal_noise",
+        "two_normal_noises",
+        "normal_plus_impulse",
+        "two_normal_plus_impulse",
+    }:
+
+        total_difference = (
+            noisy - clean
+        )
+
+        if mixture_type == "normal_noise":
+
+            actual_snr = calculate_snr_db(
+                clean,
+                total_difference,
+            )
+
+        elif mixture_type == "two_normal_noises":
+
+            actual_snr = calculate_snr_db(
+                clean,
+                total_difference,
+            )
+
+        else:
+
+            # For impulse-containing mixtures,
+            # the impulse changes the overall noise
+            # energy, so we do not label this as the
+            # original continuous-noise SNR.
+
+            actual_snr = None
+
+    else:
+
+        actual_snr = None
+
+    # ========================================================
+    # FINAL RETURN
+    # ========================================================
+
+    return (
+        clean,
+        noisy,
+        {
+            "target_snr_db": float(
+                target_snr
+            ),
+            "actual_snr_db": (
+                float(actual_snr)
+                if actual_snr is not None
+                else None
+            ),
+            "noise_components": (
+                noise_components
+            ),
+            "impulse": (
+                impulse_metadata
+            ),
+            "clipping_scale": (
+                clipping_scale
+            ),
+        },
+    )
+
+
+# ============================================================
+# PRODUCTION GENERATOR
+# ============================================================
+
+def choose_mixture_type():
+    """
+    Randomly select a mixture type according
+    to the production distribution.
+    """
+
+    value = random.random()
+
+    cumulative = 0.0
+
+    for mixture_type, probability in (
+        MIXTURE_DISTRIBUTION
+    ):
+
+        cumulative += probability
+
+        if value < cumulative:
+            return mixture_type
+
+    return MIXTURE_DISTRIBUTION[-1][0]
+
+
+def generate_production_dataset(
+    split,
+    num_samples,
+    seed=None,
+):
+    """
+    Generate stored production mixtures.
+    """
+
+    if split not in {
+        "train",
+        "validation",
+        "test",
+    }:
+        raise ValueError(
+            "Invalid split."
+        )
+
+    if num_samples <= 0:
+        raise ValueError(
+            "num_samples must be > 0"
+        )
+
+    if seed is not None:
+
+        random.seed(
+            seed
+        )
+
+        np.random.seed(
+            seed
+        )
+
+    print()
+    print("=" * 60)
+
+    print(
+        f"Generating {split}: "
+        f"{num_samples} samples"
+    )
+
+    print("=" * 60)
+
+    # ========================================================
+    # LOAD SPEECH
+    # ========================================================
+
+    speech_files = load_split_file(
+        f"speech_{split}.txt"
+    )
+
+    # ========================================================
+    # NOISE METADATA
+    # ========================================================
+
+    noise_metadata_index = (
+        build_noise_metadata_index()
+    )
+
+    split_noise_index = (
+        build_split_noise_index(
+            split,
+            noise_metadata_index,
+        )
+    )
+
+    # ========================================================
+    # GUNSHOTS
+    # ========================================================
+
+    gunshot_records = (
+        build_gunshot_records(
+            split
+        )
+    )
+
+    print(
+        f"Speech available : "
+        f"{len(speech_files)}"
+    )
+
+    print(
+        "Normal noise:"
+    )
+
+    for category in sorted(
+        split_noise_index
+    ):
+
+        print(
+            f"  {category:<15} "
+            f"{len(split_noise_index[category])}"
+        )
+
+    print(
+        f"Gunshots available: "
+        f"{len(gunshot_records)}"
+    )
+
+    # ========================================================
+    # OUTPUT DIRECTORIES
+    # ========================================================
+
+    clean_dir = (
+        OUTPUT_ROOT
+        / split
+        / "clean"
+    )
+
+    noisy_dir = (
+        OUTPUT_ROOT
+        / split
+        / "noisy"
+    )
+
+    clean_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    noisy_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ========================================================
+    # IDS
+    # ========================================================
+
+    next_id = get_next_sample_id()
+
+    generated_records = []
+
+    counts = {}
+
+    # ========================================================
+    # GENERATE
+    # ========================================================
+
+    for index in range(
+        num_samples
+    ):
+
+        sample_id = (
+            f"IG_{next_id:06d}"
+        )
+
+        next_id += 1
+
+        mixture_type = (
+            choose_mixture_type()
+        )
+
+        speech_path = random.choice(
+            speech_files
+        )
+
+        (
+            clean,
+            noisy,
+            info,
+        ) = generate_sample(
+            split=split,
+            mixture_type=mixture_type,
+            speech_path=speech_path,
+            split_noise_index=split_noise_index,
+            gunshot_records=gunshot_records,
+        )
+
+        # ====================================================
+        # FINAL VALIDATION
+        # ====================================================
+
+        clean = np.asarray(
+            clean,
+            dtype=np.float32,
+        )
+
+        noisy = np.asarray(
+            noisy,
+            dtype=np.float32,
+        )
+
+        if len(clean) != CLIP_SAMPLES:
+
+            raise RuntimeError(
+                f"Clean length error: "
+                f"{sample_id}"
+            )
+
+        if len(noisy) != CLIP_SAMPLES:
+
+            raise RuntimeError(
+                f"Noisy length error: "
+                f"{sample_id}"
+            )
+
+        if not np.isfinite(clean).all():
+
+            raise RuntimeError(
+                f"Clean contains NaN/Inf: "
+                f"{sample_id}"
+            )
+
+        if not np.isfinite(noisy).all():
+
+            raise RuntimeError(
+                f"Noisy contains NaN/Inf: "
+                f"{sample_id}"
+            )
+
+        # ----------------------------------------------------
+        # Final safety normalization.
+        #
+        # This is intentionally done immediately before
+        # writing the WAV files.
+        # ----------------------------------------------------
+
+        final_peak = max(
+            float(
+                np.max(
+                    np.abs(clean)
+                )
+            ),
+            float(
+                np.max(
+                    np.abs(noisy)
+                )
+            ),
+        )
+
+        final_target_peak = 0.98
+
+        if final_peak > 0.981:
+
+            final_scale = (
+                final_target_peak
+                / final_peak
+            )
+
+            clean *= final_scale
+            noisy *= final_scale
+
+            info["clipping_scale"] = (
+                float(
+                    info["clipping_scale"]
+                )
+                * float(final_scale)
+            )
+
+        # ----------------------------------------------------
+        # Convert once more to float32 before checking.
+        # ----------------------------------------------------
+
+        clean = clean.astype(
+            np.float32
+        )
+
+        noisy = noisy.astype(
+            np.float32
+        )
+
+        noisy_peak = float(
+            np.max(
+                np.abs(noisy)
+            )
+        )
+
+        clean_peak = float(
+            np.max(
+                np.abs(clean)
+            )
+        )
+
+        # ----------------------------------------------------
+        # Allow only a tiny float32 rounding tolerance.
+        # Anything substantially above 0.98 would indicate
+        # a real protection failure.
+        # ----------------------------------------------------
+
+        if clean_peak > 0.981:
+
+            raise RuntimeError(
+                f"Clean clipping: "
+                f"{sample_id} "
+                f"(peak={clean_peak:.9f})"
+            )
+
+        if noisy_peak > 0.981:
+
+            raise RuntimeError(
+                f"Noisy clipping: "
+                f"{sample_id} "
+                f"(peak={noisy_peak:.9f})"
+            )
+
+        # ====================================================
+        # PATHS
+        # ====================================================
+
+        clean_path = (
+            clean_dir
+            / f"{sample_id}.wav"
+        )
+
+        noisy_path = (
+            noisy_dir
+            / f"{sample_id}.wav"
+        )
+
+        # ====================================================
+        # SAVE AUDIO
+        # ====================================================
+
+        sf.write(
+            str(clean_path),
+            clean,
+            SAMPLE_RATE,
+            subtype="PCM_16",
+        )
+
+        sf.write(
+            str(noisy_path),
+            noisy,
+            SAMPLE_RATE,
+            subtype="PCM_16",
+        )
+
+        # ====================================================
+        # METADATA
+        # ====================================================
+
+        record = {
+            "sample_id": sample_id,
+
+            "split": split,
+
+            "clean_path": str(
+                clean_path
+            ),
+
+            "noisy_path": str(
+                noisy_path
+            ),
+
+            "speech": {
+                "path": str(
+                    speech_path
+                ),
+                "source": "LibriSpeech",
+            },
+
+            "mixture_type": (
+                mixture_type
+            ),
+
+            "noise_components": (
+                info[
+                    "noise_components"
+                ]
+            ),
+
+            "impulse": (
+                info[
+                    "impulse"
+                ]
+            ),
+
+            "target_snr_db": (
+                info[
+                    "target_snr_db"
+                ]
+            ),
+
+            "actual_snr_db": (
+                info[
+                    "actual_snr_db"
+                ]
+            ),
+
+            "duration_sec": (
+                CLIP_DURATION_SEC
+            ),
+
+            "sample_rate": (
+                SAMPLE_RATE
+            ),
 
             "channels": 1,
 
-            "duration_sec": len(clean) / 16000,
-
-            "clean_file": clean_path,
-
-            "noisy_file": output_path,
-
-            "enhanced_file": None
-        },
-
-        "speech": {
-
-            "language": "unknown",
-
-            "speaker_id": "unknown",
-
-            "gender": "unknown",
-
-            "source": "test"
-        },
-
-        "noise": {
-
-            "type": "mixed",
-
-            "source": "test",
-
-            "noise_file": normal_noise_path,
-
-            "category": "normal_plus_impulsive"
-        },
-
-        "mixing": {
-
-            "target_snr_db": target_snr_db,
-
-            "actual_snr_db": float(
-                actual_snr_db
+            "clipping_scale": (
+                info[
+                    "clipping_scale"
+                ]
             ),
 
-            "speech_rms": float(
-                speech_rms
+            "generator": (
+                "mix_combined_v3.3"
             ),
-
-            "noise_rms": float(
-                noise_rms
-            ),
-
-            "mixing_method":
-                "rms_scaling_plus_impulse",
-
-            "impulse_gain": impulse_gain
-        },
-
-        "impulses": [
-
-            {
-
-                "event_id": "imp_001",
-
-                "type": "unknown",
-
-                "start_sec": float(
-                    start_time
-                ),
-
-                "end_sec": float(
-                    end_time
-                ),
-
-                "duration_ms": float(
-                    impulse_duration * 1000
-                )
-            }
-        ],
-
-        "split": "test",
-
-        "generation": {
-
-            "generator_version":
-                "combined_v1.1"
-
         }
-    }
 
-    # --------------------------------------------------
-    # Print result
-    # --------------------------------------------------
+        generated_records.append(
+            record
+        )
+
+        counts[
+            mixture_type
+        ] = (
+            counts.get(
+                mixture_type,
+                0,
+            )
+            + 1
+        )
+
+        # ====================================================
+        # METADATA APPEND
+        # ====================================================
+
+        METADATA_PATH.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with open(
+            METADATA_PATH,
+            "a",
+            encoding="utf-8",
+        ) as f:
+
+            f.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+        # ====================================================
+        # PROGRESS
+        # ====================================================
+
+        print(
+            f"[{index + 1:>5}/"
+            f"{num_samples}] "
+            f"{sample_id} | "
+            f"{mixture_type:<24}"
+        )
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
 
     print()
 
     print(
-        "========== COMBINED MIX =========="
+        "Generation complete."
     )
 
     print(
-        "Sample ID:",
-        sample_id
+        f"Split: {split}"
     )
 
     print(
-        "Target SNR:",
-        target_snr_db,
-        "dB"
+        f"Samples: {num_samples}"
     )
 
     print(
-        "Actual SNR:",
-        actual_snr_db,
-        "dB"
+        "Mixture types:"
     )
 
-    print(
-        "Impulse gain:",
-        impulse_gain
-    )
+    for mixture_type in sorted(
+        counts
+    ):
 
-    print(
-        "Impulse start:",
-        start_time,
-        "sec"
-    )
+        print(
+            f"  {mixture_type:<24}"
+            f"{counts[mixture_type]}"
+        )
 
-    print(
-        "Impulse end:",
-        end_time,
-        "sec"
-    )
-
-    print(
-        "Impulse duration:",
-        impulse_duration,
-        "seconds"
-    )
-
-    print(
-        "Final peak:",
-        np.max(np.abs(mixed))
-    )
-
-    print(
-        "=================================="
-    )
-
-    # --------------------------------------------------
-    # Save audio
-    # --------------------------------------------------
-
-    os.makedirs(
-        os.path.dirname(output_path),
-        exist_ok=True
-    )
-
-    sf.write(
-        output_path,
-        mixed,
-        16000,
-        subtype="PCM_16"
-    )
-
-    print(
-        "Saved:",
-        output_path
-    )
-
-    # --------------------------------------------------
-    # Save metadata
-    # --------------------------------------------------
-
-    metadata_path = (
-        "data/metadata/samples.jsonl"
-    )
-
-    save_metadata(
-        metadata_path,
-        metadata
-    )
-
-    print(
-        "Saved metadata:",
-        metadata_path
-    )
+    return generated_records
 
 
-# ======================================================
-# Run
-# ======================================================
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
 
-    snr_levels = [
-        -5,
-        0,
-        5,
-        10,
-        15,
-        20
-    ]
+    import argparse
 
-    impulse_gains = [
-        0.1,
-        0.25,
-        0.5,
-        0.75,
-        1.0
-    ]
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate Impulse Guard "
+            "production mixtures."
+        )
+    )
 
-    sample_number = 1
+    parser.add_argument(
+        "--split",
+        choices=[
+            "train",
+            "validation",
+            "test",
+        ],
+        required=True,
+    )
 
-    for snr in snr_levels:
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        required=True,
+    )
 
-        for gain in impulse_gains:
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
 
-            create_combined_sample(
-                target_snr_db=snr,
-                impulse_gain=gain,
-                sample_number=sample_number
-            )
+    args = parser.parse_args()
 
-            sample_number += 1
+    generate_production_dataset(
+        split=args.split,
+        num_samples=args.num_samples,
+        seed=args.seed,
+    )

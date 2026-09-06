@@ -1,16 +1,276 @@
-# Python virtual environments
+# ==============================================================================
+# Impulse Guard - Git Ignore Configuration
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Data & Datasets (Audio files, raw datasets, mixtures, labels, features)
+# ------------------------------------------------------------------------------
+data/
+dataset/
+datasets/
+
+# Audio formats (prevent accidental commit of audio files anywhere in repo)
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.opus
+*.m4a
+*.aac
+*.wma
+*.aiff
+*.sph
+*.pcm
+*.raw
+*.WAV
+*.MP3
+*.FLAC
+*.OGG
+
+# Numerical data, feature matrices, and cached tensors
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.arrow
+*.tfrecord
+*.mat
+
+# Dataset archives and compressed dumps
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+*.gz
+*.bz2
+
+# ------------------------------------------------------------------------------
+# 2. Machine Learning Models, Checkpoints & Weights
+# ------------------------------------------------------------------------------
+checkpoints/
+models/**/*.pt
+models/**/*.pth
+models/**/*.ckpt
+models/**/*.onnx
+models/**/*.tflite
+models/**/*.bin
+models/**/*.weights
+models/**/*.pb
+models/**/*.engine
+models/**/*.safetensors
+models/**/*.h5
+models/**/*.keras
+models/**/*.pkl
+models/**/*.pickle
+models/**/*.joblib
+
+# TensorFlow SavedModel directories & files
+models/**/variables/
+models/**/assets/
+models/**/saved_model.pb
+models/**/fingerprint.pb
+
+# Model training histories & metrics
+models/**/training_history*.json
+models/**/history*.json
+models/**/metrics*.json
+
+# Global model binary formats
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+*.weights
+*.engine
+*.safetensors
+*.keras
+*.h5
+*.hdf5
+*.pb
+*.bin
+*.savedmodel
+*.pkl
+*.pickle
+*.joblib
+
+# ------------------------------------------------------------------------------
+# 3. Experiment Results, Benchmarks & Generated Outputs
+# ------------------------------------------------------------------------------
+results/
+runs/
+wandb/
+lightning_logs/
+tensorboard/
+mlruns/
+.neptune/
+*.log
+tree.txt
+training_history.json
+*.prof
+*.pstats
+
+# ------------------------------------------------------------------------------
+# 4. Environment Variables & Sensitive Credentials
+# ------------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.template
+*.env
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+credentials.json
+secrets.json
+token.json
+*.token
+id_rsa*
+id_ed25519*
+
+# ------------------------------------------------------------------------------
+# 5. Python Virtual Environments & Bytecode Caches
+# ------------------------------------------------------------------------------
 .venv/
 venv/
 env/
 ENV/
+env.bak/
+venv.bak/
+site-packages/
+.virtualenv/
 
-# Python packages/cache
+# Bytecode & C extensions
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
+*.dylib
+*.dll
+*.pyd
 
-# Installed packages
-site-packages/
+# Python distribution / packaging artifacts
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
 
-# ML/data
-*.pyc
+# ------------------------------------------------------------------------------
+# 6. Testing, Linting & Coverage
+# ------------------------------------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.cache/
+coverage.xml
+nosetests.xml
+.benchmarks/
+
+# ------------------------------------------------------------------------------
+# 7. Jupyter Notebooks
+# ------------------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+*.nbconvert/
+.virtual_documents/
+
+# ------------------------------------------------------------------------------
+# 8. Embedded / Firmware (ESP32 & PlatformIO)
+# ------------------------------------------------------------------------------
+.pio/
+.pioenvs/
+.piolibdeps/
+.clangd/
+firmware/**/.pio/
+firmware/**/.pioenvs/
+firmware/**/.piolibdeps/
+firmware/**/.clangd/
+firmware/**/.vscode/
+firmware/**/build/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+sdkconfig.*
+compile_commands.json
+bootloader.bin
+partitions.bin
+*.elf
+*.hex
+*.map
+*.o
+*.a
+*.d
+*.bin
+
+# ------------------------------------------------------------------------------
+# 9. IDEs, Editors & Operating System Files
+# ------------------------------------------------------------------------------
+# VS Code (ignore workspace state and caches, allow shared configs)
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+*.code-workspace
+
+# JetBrains / PyCharm
+.idea/
+
+# Editor temporary & backup files
+*.swp
+*.swo
+*.sw?
+*~
+*.save
+*.save.*
+*.bak
+*.bak.*
+*.backup
+*.backup.*
+*.before_*
+*.old
+*.orig
+*.tmp
+*.temp
+*#
+.#*
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary directories
+[Tt]emp/
+[Tt]mp/
