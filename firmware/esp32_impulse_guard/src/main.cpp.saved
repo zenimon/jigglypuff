@@ -1,0 +1,215 @@
+#include <Arduino.h>
+#include "driver/i2s_std.h"
+
+// ---- Shared clock bus ----
+#define SHARED_BCLK 15   // INMP441 SCK + MAX98357A BCLK
+#define SHARED_WS   16   // INMP441 WS  + MAX98357A LRC
+
+// ---- Data lines ----
+#define MIC_SD   17      // INMP441 data in
+#define AMP_DIN  5       // MAX98357A data out
+
+#define SAMPLE_RATE 16000
+#define RECORD_SECONDS 5
+#define PAUSE_SECONDS 2
+#define NUM_SAMPLES (SAMPLE_RATE * RECORD_SECONDS)
+#define CHUNK 256
+
+float VOLUME_GAIN = 4;
+
+i2s_chan_handle_t tx_handle;
+i2s_chan_handle_t rx_handle;
+
+int16_t audioBuffer[NUM_SAMPLES];
+
+// ---------------- SETUP CHANNELS ONCE, NEVER TORN DOWN ----------------
+void startFullDuplexChannel() {
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle);
+
+  i2s_std_config_t std_cfg = {
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)SHARED_BCLK,
+      .ws   = (gpio_num_t)SHARED_WS,
+      .dout = (gpio_num_t)AMP_DIN,
+      .din  = (gpio_num_t)MIC_SD,
+      .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+    },
+  };
+  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+  i2s_channel_init_std_mode(tx_handle, &std_cfg);
+  i2s_channel_init_std_mode(rx_handle, &std_cfg);
+
+  i2s_channel_enable(tx_handle);
+  i2s_channel_enable(rx_handle);
+
+  delay(50);
+
+  // Push silence to let the amp lock onto the clock cleanly, ONCE at boot
+  int32_t silence[CHUNK] = {0};
+  size_t written;
+  int warmupWrites = (SAMPLE_RATE * 0.6) / CHUNK;
+  for (int i = 0; i < warmupWrites; i++) {
+    i2s_channel_write(tx_handle, silence, sizeof(silence), &written, portMAX_DELAY);
+  }
+}
+
+// Write a block of silence to the speaker (used during record/pause phases,
+// keeps the clock continuously running so the amp never re-locks/chirps)
+void writeSilenceBlock() {
+  int32_t silence[CHUNK] = {0};
+  size_t written;
+  i2s_channel_write(tx_handle, silence, sizeof(silence), &written, portMAX_DELAY);
+}
+
+// ---------------- RECORD ----------------
+void recordAudio() {
+  Serial.print("Recording... speak now! (");
+  Serial.print(RECORD_SECONDS);
+  Serial.println(" seconds)");
+
+  int32_t rawSample;
+  size_t bytesRead;
+  long long sum = 0;
+  int16_t peak = 0;
+  long absSum = 0;
+
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    i2s_channel_read(rx_handle, &rawSample, sizeof(rawSample), &bytesRead, portMAX_DELAY);
+    int16_t sample16 = (int16_t)(rawSample >> 14);
+    audioBuffer[i] = sample16;
+    sum += sample16;
+
+    int16_t absVal = abs(sample16);
+    if (absVal > peak) peak = absVal;
+    absSum += absVal;
+
+    // Keep speaker fed with silence during recording so clock never stops
+    if (i % CHUNK == 0) writeSilenceBlock();
+  }
+
+  int16_t dcOffset = (int16_t)(sum / NUM_SAMPLES);
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    audioBuffer[i] -= dcOffset;
+  }
+
+  long avgLevel = absSum / NUM_SAMPLES;
+
+  Serial.println("Recording done.");
+  Serial.print("Peak level: ");
+  Serial.println(peak);
+  Serial.print("Average level: ");
+  Serial.println(avgLevel);
+}
+
+// ---------------- VOLUME ----------------
+void applyVolume() {
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    int32_t boosted = (int32_t)(audioBuffer[i] * VOLUME_GAIN);
+    if (boosted > 32767) boosted = 32767;
+    if (boosted < -32768) boosted = -32768;
+    audioBuffer[i] = (int16_t)boosted;
+  }
+}
+
+// ---------------- FADE ----------------
+void applyFade() {
+  int fadeSamples = SAMPLE_RATE * 0.01;
+
+  for (int i = 0; i < fadeSamples; i++) {
+    float factor = (float)i / fadeSamples;
+    audioBuffer[i] = (int16_t)(audioBuffer[i] * factor);
+  }
+  for (int i = 0; i < fadeSamples; i++) {
+    int idx = NUM_SAMPLES - 1 - i;
+    float factor = (float)i / fadeSamples;
+    audioBuffer[idx] = (int16_t)(audioBuffer[idx] * factor);
+  }
+}
+
+// ---------------- PLAYBACK ----------------
+void playAudio() {
+  Serial.println("Playing back...");
+
+  size_t bytesWritten, bytesRead;
+  int32_t sampleBuf[CHUNK];
+  int32_t dummyRead;
+
+  for (int i = 0; i < NUM_SAMPLES; i += CHUNK) {
+    int chunkLen = min(CHUNK, NUM_SAMPLES - i);
+    for (int j = 0; j < chunkLen; j++) {
+      sampleBuf[j] = ((int32_t)audioBuffer[i + j]) << 16;
+    }
+    i2s_channel_write(tx_handle, sampleBuf, chunkLen * sizeof(int32_t), &bytesWritten, portMAX_DELAY);
+
+    // Drain the mic RX buffer during playback so it doesn't overflow/stall
+    i2s_channel_read(rx_handle, &dummyRead, sizeof(dummyRead), &bytesRead, 0);
+  }
+
+  Serial.println("Playback done.");
+}
+
+// ---------------- PAUSE (keep clock alive, output silence) ----------------
+void pauseWithSilence(int seconds) {
+  Serial.print("Pausing ");
+  Serial.print(seconds);
+  Serial.println(" seconds...");
+
+  int32_t dummyRead;
+  size_t bytesRead;
+  long totalChunks = (SAMPLE_RATE * seconds) / CHUNK;
+
+  for (long i = 0; i < totalChunks; i++) {
+    writeSilenceBlock();
+    i2s_channel_read(rx_handle, &dummyRead, sizeof(dummyRead), &bytesRead, 0);
+  }
+}
+
+// ---------------- LIVE VOLUME CONTROL ----------------
+void checkForVolumeInput() {
+  if (Serial.available() > 0) {
+    float newGain = Serial.parseFloat();
+    while (Serial.available() > 0) Serial.read();
+
+    if (newGain > 0) {
+      VOLUME_GAIN = newGain;
+      Serial.print(">>> Volume gain updated to: ");
+      Serial.println(VOLUME_GAIN);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println("======================================");
+  Serial.print("  RECORD (");
+  Serial.print(RECORD_SECONDS);
+  Serial.print("s) -> PAUSE (");
+  Serial.print(PAUSE_SECONDS);
+  Serial.println("s) -> PLAYBACK");
+  Serial.println("======================================");
+  Serial.print("Current VOLUME_GAIN: ");
+  Serial.println(VOLUME_GAIN);
+  Serial.println("Type a number + Enter anytime to change volume.");
+
+  startFullDuplexChannel();
+}
+
+void loop() {
+  checkForVolumeInput();
+
+  recordAudio();
+  applyVolume();
+  applyFade();
+
+  pauseWithSilence(PAUSE_SECONDS);
+
+  playAudio();
+
+  Serial.println("Cycle complete. Restarting...");
+}
