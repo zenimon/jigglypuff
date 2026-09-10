@@ -22,10 +22,6 @@ datasets/
 *.sph
 *.pcm
 *.raw
-*.WAV
-*.MP3
-*.FLAC
-*.OGG
 
 # Numerical data, feature matrices, and cached tensors
 *.npy
@@ -36,7 +32,6 @@ datasets/
 *.feather
 *.arrow
 *.tfrecord
-*.mat
 
 # Dataset archives and compressed dumps
 *.tar
@@ -63,21 +58,6 @@ models/**/*.pb
 models/**/*.engine
 models/**/*.safetensors
 models/**/*.h5
-models/**/*.keras
-models/**/*.pkl
-models/**/*.pickle
-models/**/*.joblib
-
-# TensorFlow SavedModel directories & files
-models/**/variables/
-models/**/assets/
-models/**/saved_model.pb
-models/**/fingerprint.pb
-
-# Model training histories & metrics
-models/**/training_history*.json
-models/**/history*.json
-models/**/metrics*.json
 
 # Global model binary formats
 *.pt
@@ -88,15 +68,6 @@ models/**/metrics*.json
 *.weights
 *.engine
 *.safetensors
-*.keras
-*.h5
-*.hdf5
-*.pb
-*.bin
-*.savedmodel
-*.pkl
-*.pickle
-*.joblib
 
 # ------------------------------------------------------------------------------
 # 3. Experiment Results, Benchmarks & Generated Outputs
@@ -106,13 +77,8 @@ runs/
 wandb/
 lightning_logs/
 tensorboard/
-mlruns/
-.neptune/
 *.log
 tree.txt
-training_history.json
-*.prof
-*.pstats
 
 # ------------------------------------------------------------------------------
 # 4. Environment Variables & Sensitive Credentials
@@ -131,9 +97,6 @@ training_history.json
 credentials.json
 secrets.json
 token.json
-*.token
-id_rsa*
-id_ed25519*
 
 # ------------------------------------------------------------------------------
 # 5. Python Virtual Environments & Bytecode Caches
@@ -145,16 +108,12 @@ ENV/
 env.bak/
 venv.bak/
 site-packages/
-.virtualenv/
 
 # Bytecode & C extensions
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-*.dylib
-*.dll
-*.pyd
 
 # Python distribution / packaging artifacts
 .Python
@@ -175,7 +134,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-pip-wheel-metadata/
 
 # ------------------------------------------------------------------------------
 # 6. Testing, Linting & Coverage
@@ -189,10 +147,6 @@ htmlcov/
 .tox/
 .nox/
 .hypothesis/
-.cache/
-coverage.xml
-nosetests.xml
-.benchmarks/
 
 # ------------------------------------------------------------------------------
 # 7. Jupyter Notebooks
@@ -200,7 +154,6 @@ nosetests.xml
 .ipynb_checkpoints/
 *-checkpoint.ipynb
 *.nbconvert/
-.virtual_documents/
 
 # ------------------------------------------------------------------------------
 # 8. Embedded / Firmware (ESP32 & PlatformIO)
@@ -210,25 +163,15 @@ nosetests.xml
 .piolibdeps/
 .clangd/
 firmware/**/.pio/
-firmware/**/.pioenvs/
-firmware/**/.piolibdeps/
-firmware/**/.clangd/
-firmware/**/.vscode/
 firmware/**/build/
 sdkconfig
 sdkconfig.old
-sdkconfig.ci
-sdkconfig.*
-compile_commands.json
-bootloader.bin
-partitions.bin
 *.elf
 *.hex
 *.map
 *.o
 *.a
 *.d
-*.bin
 
 # ------------------------------------------------------------------------------
 # 9. IDEs, Editors & Operating System Files
@@ -245,22 +188,12 @@ partitions.bin
 
 # Editor temporary & backup files
 *.swp
+
 *.swo
-*.sw?
 *~
 *.save
-*.save.*
 *.bak
-*.bak.*
-*.backup
-*.backup.*
-*.before_*
-*.old
 *.orig
-*.tmp
-*.temp
-*#
-.#*
 
 # Operating System files
 .DS_Store
